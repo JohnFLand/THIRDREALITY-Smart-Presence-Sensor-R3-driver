@@ -1,6 +1,6 @@
 /**
  *  THIRDREALITY Smart Presence Sensor R3 (3RPL01084Z)
- *  Version 0.17
+ *  Version 0.19
  *
  *  Hubitat driver providing:
  *   -  RGB and color-temperature light control
@@ -13,20 +13,25 @@
  *   -  New-firmware radar, TVOC alarm, and lighting start-up configuration
  *   -  Manual TVOC baseline recalibration and Zigbee OTA update request
  *
- *  Version 0.17 notes:
- *   -  Adds manufacturer-specific controls introduced by newer ThirdReality firmware.
- *   -  Device settings are NOT automatically written when preferences are saved.
- *      Use the Apply Device Settings command after reviewing the preferences.
- *   -  Reads and displays the Basic-cluster software build/firmware version.
- *   -  Keeps value 0 as AirQuality = "possible error" because 0 may represent
- *      either a valid device output or unavailable/invalid TVOC data.
- *   -  Preserves the defensive multi-format TVOC decoder because firmware/platform
+ *  Version 0.19 notes:
+ *   -  Testing on device firmware 1.00.40 confirmed that Color Loop works.
+ *   -  The standard Zigbee Identify effects (Blink, Breathe, Okay, Channel
+ *      Change, Finish, and Stop) were accepted without an error but produced
+ *      no visible response, so their test commands have been removed.
+ *   -  Hubitat's Flash capability is now implemented by driver-controlled
+ *      immediate On/Off commands rather than the unsupported Identify effect.
+ *   -  Supports both flash() and flash(rateToFlash), where rateToFlash is the
+ *      optional Hubitat flash interval in milliseconds.
+ *   -  Adds Stop Flash and an automatic safety stop. On, Off, level, color,
+ *      color-temperature, and level-change commands also stop active flashing.
+ *   -  Retains the working device-side Color Loop start/stop commands.
+ *   -  Retains all v0.17 radar, TVOC, firmware, and lighting functionality.
  *      combinations have exposed attribute 0x0000 as both integer and float data.
  */
 
 import groovy.transform.Field
 
-@Field static final String DRIVER_VERSION = "0.17"
+@Field static final String DRIVER_VERSION = "0.19"
 
 @Field static final Integer CLUSTER_BASIC        = 0x0000
 @Field static final Integer CLUSTER_ON_OFF       = 0x0006
@@ -35,6 +40,10 @@ import groovy.transform.Field
 @Field static final Integer CLUSTER_ILLUMINANCE  = 0x0400
 @Field static final Integer CLUSTER_OCCUPANCY    = 0x0406
 @Field static final Integer CLUSTER_TVOC         = 0x042E
+
+
+// Color Control Color Loop Set command
+@Field static final Integer CMD_COLOR_LOOP_SET        = 0x44
 
 @Field static final String MFG_CODE = "0x1407"
 
@@ -67,7 +76,7 @@ import groovy.transform.Field
 @Field static final Integer CT_MAX_KELVIN = 6500
 
 metadata {
-    definition(name: "THIRDREALITY Smart Presence Sensor R3", namespace: "openai v0.17", author: "OpenAI", singleThreaded: true) {
+    definition(name: "THIRDREALITY Smart Presence Sensor R3", namespace: "openai v0.19", author: "OpenAI", singleThreaded: true) {
         capability "Actuator"
         capability "Sensor"
         capability "Light"
@@ -78,6 +87,7 @@ metadata {
         capability "ColorControl"
         capability "ColorTemperature"
         capability "ColorMode"
+        capability "Flash"
         capability "MotionSensor"
         capability "IlluminanceMeasurement"
         capability "Refresh"
@@ -101,6 +111,11 @@ metadata {
         command "applyDeviceSettings"
         command "resetTVOCCalibration"
         command "updateFirmware"
+
+        // RGB effect controls. None are run automatically.
+        command "stopFlash"
+        command "startColorLoop"
+        command "stopColorLoop"
 
         fingerprint profileId: "0104", endpointId: "01",
             inClusters: "0000,0003,0004,0005,0006,0008,0012,0300,0400,0406,042E,1000",
@@ -163,6 +178,17 @@ metadata {
             description: "Requested levels above 0% but below this minimum are raised to this value", defaultValue: 5, range: "0..100"
         input name: "colorStaging", type: "bool", title: "Enable color pre-staging when light is off", defaultValue: false
         input name: "hiRezHue", type: "bool", title: "Use hue in degrees (0-360) instead of percent", defaultValue: false
+        input name: "defaultFlashRateMs", type: "number", title: "Default software flash interval (milliseconds)",
+            description: "Used when Flash is invoked without a rate. Values below 500 ms are raised to 500 ms to limit Zigbee traffic.",
+            defaultValue: 1000, range: "500..30000"
+        input name: "flashSafetyStopMinutes", type: "number", title: "Software flash automatic stop (minutes)",
+            description: "Prevents an accidentally started flash from running indefinitely. Stop Flash, On, Off, level, or color commands stop it sooner.",
+            defaultValue: 10, range: "1..30"
+        input name: "colorLoopCycleSeconds", type: "number", title: "Color-loop cycle time (seconds)",
+            description: "Time for one complete hue cycle. Used only by Start Color Loop.", defaultValue: 10, range: "1..65535"
+        input name: "colorLoopDirection", type: "enum", title: "Color-loop direction",
+            options: [[1:"Increasing hue"], [0:"Decreasing hue"]], defaultValue: 1,
+            description: "Used only by Start Color Loop. Confirmed working on firmware 1.00.40."
         input name: "autoRefreshMinutes", type: "enum", title: "Automatic refresh interval",
             options: [[0:"Disabled"], [1:"Every 1 minute"], [5:"Every 5 minutes"], [10:"Every 10 minutes"], [15:"Every 15 minutes"], [30:"Every 30 minutes"]], defaultValue: 0
         input name: "illuminanceMinDeltaLux", type: "number", title: "Illuminance deadband (Lux)",
@@ -186,6 +212,7 @@ def installed() {
     sendEvent(name: "motion", value: "inactive")
     sendEvent(name: "occupancy", value: "clear")
     unschedule("syntheticMotionClear")
+    cancelSoftwareFlash(true)
     scheduleAutoRefresh()
 }
 
@@ -196,6 +223,7 @@ def updated() {
     log.warn "description logging is: ${txtEnable == true}"
     log.warn "driver motion/presence clear timeout is: ${safeToInt(settings.motionClearSeconds, 0)} second(s)"
     log.warn "Device preferences are not written automatically; use Apply Device Settings when ready."
+    cancelSoftwareFlash(true)
     if (logEnable) runIn(1800, "logsOff")
     if (safeToInt(settings.motionClearSeconds, 0) <= 0) unschedule("syntheticMotionClear")
     scheduleAutoRefresh()
@@ -748,6 +776,7 @@ private void setGenericColorName() {
 
 def on() {
     if (logEnable) log.debug "on()"
+    cancelSoftwareFlash(true)
     Integer transitionMs = getConfiguredTransitionMs("onTransitionTime", 1000)
     Integer targetLevel  = resolveOnLevelPercent()
     Integer zigbeeLevel  = scalePercentToZigbeeLevel(targetLevel)
@@ -765,6 +794,7 @@ def on() {
 
 def off() {
     if (logEnable) log.debug "off()"
+    cancelSoftwareFlash(true)
     Integer transitionMs = getConfiguredTransitionMs("offTransitionTime", 1000)
     Integer transition = transitionMsToTenths(transitionMs)
     Integer delayMs = Math.max(400, transitionMs + 400)
@@ -780,6 +810,7 @@ def off() {
 
 def startLevelChange(direction) {
     if (logEnable) log.debug "startLevelChange(${direction})"
+    cancelSoftwareFlash(true)
     Integer upDown = direction == "down" ? 1 : 0
     Integer unitsPerSecond = Math.max(1, safeToInt(settings.startLevelChangeRate, 100))
     return "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0008 1 {0x${intTo8bitUnsignedHex(upDown)} 0x${intTo8bitUnsignedHex(unitsPerSecond)}}"
@@ -787,6 +818,7 @@ def startLevelChange(direction) {
 
 def stopLevelChange() {
     if (logEnable) log.debug "stopLevelChange()"
+    cancelSoftwareFlash(true)
     return [
         "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0008 3 {}",
         "delay 200",
@@ -801,6 +833,7 @@ def setLevel(value) {
 
 def setLevel(value, rate) {
     if (logEnable) log.debug "setLevel(${value}, ${rate})"
+    cancelSoftwareFlash(true)
     Integer requestedLevel = Math.max(0, Math.min(100, safeToInt(value, 0)))
     Integer level = clampLevelPercent(requestedLevel)
     BigDecimal defaultRateSeconds = getConfiguredTransitionSeconds("levelTransitionTime", 1.0G)
@@ -832,6 +865,7 @@ def setLevel(value, rate) {
 
 def setColor(Map value) {
     if (logEnable) log.debug "setColor(${value})"
+    cancelSoftwareFlash(true)
     if (value?.hue == null || value?.saturation == null) return
 
     Integer hueInput   = Math.max(0, Math.min(hiRezHue ? 360 : 100, safeToInt(value.hue, 0)))
@@ -902,6 +936,7 @@ def setColor(Map value) {
 
 def setHue(value) {
     if (logEnable) log.debug "setHue(${value})"
+    cancelSoftwareFlash(true)
     Integer maxHue = hiRezHue ? 360 : 100
     Integer hueInput = Math.max(0, Math.min(maxHue, safeToInt(value, 0)))
     Integer rateMs = getConfiguredTransitionMs("rgbTransitionTime", 1000)
@@ -932,6 +967,7 @@ def setHue(value) {
 
 def setSaturation(value) {
     if (logEnable) log.debug "setSaturation(${value})"
+    cancelSoftwareFlash(true)
     Integer satInput = Math.max(0, Math.min(100, safeToInt(value, 100)))
     Integer rateMs = getConfiguredTransitionMs("rgbTransitionTime", 1000)
     Integer transition = transitionMsToTenths(rateMs)
@@ -967,6 +1003,7 @@ def setColorTemperature(value, level) {
 
 def setColorTemperature(value, level, transitionTime) {
     if (logEnable) log.debug "setColorTemperature(${value}, ${level}, ${transitionTime})"
+    cancelSoftwareFlash(true)
     Integer kelvin = Math.max(CT_MIN_KELVIN, Math.min(CT_MAX_KELVIN, safeToInt(value, 2700)))
     Integer mireds = kelvinToMireds(kelvin)
     Integer rateMs = hasMeaningfulValue(transitionTime) ?
@@ -1083,6 +1120,140 @@ def resetTVOCCalibration() {
 def updateFirmware() {
     log.warn "Requesting a Zigbee OTA firmware check/update..."
     return zigbee.updateFirmware()
+}
+
+
+/**
+ * Standard Hubitat Flash capability command.
+ *
+ * Hubitat may call flash() or flash(rateToFlash), where rateToFlash is the
+ * interval in milliseconds. Firmware 1.00.40 ignored the Identify-cluster
+ * Blink effect, so this implementation alternates immediate On and Off
+ * commands in the driver.
+ */
+def flash() {
+    return startSoftwareFlash(null)
+}
+
+def flash(Number rateToFlash) {
+    return startSoftwareFlash(rateToFlash)
+}
+
+private Object startSoftwareFlash(Object requestedRate) {
+    Integer configuredRate = safeToInt(settings.defaultFlashRateMs, 1000)
+    Integer rateMs = safeToInt(requestedRate, configuredRate)
+    rateMs = Math.max(500, Math.min(30000, rateMs))
+
+    cancelSoftwareFlash(true)
+
+    String currentSwitch = device.currentValue("switch")?.toString()
+    state.softwareFlashing = true
+    state.softwareFlashRateMs = rateMs
+    state.softwareFlashRestoreSwitch = currentSwitch in ["on", "off"] ? currentSwitch : "off"
+
+    Integer safetyMinutes = Math.max(1, Math.min(30, safeToInt(settings.flashSafetyStopMinutes, 10)))
+    runIn(safetyMinutes * 60, "softwareFlashSafetyStop")
+
+    log.warn "Starting driver-controlled RGB flash at ${rateMs} ms intervals; " +
+        "automatic stop in ${safetyMinutes} minute(s)"
+
+    // Stop a possible color loop before beginning a steady-color on/off flash.
+    List cmds = [colorLoopStopCommand(), "delay 100"]
+    cmds << (currentSwitch == "on" ? softwareFlashOff() : softwareFlashOn())
+    return cmds.flatten()
+}
+
+/**
+ * Explicitly stop driver-controlled flashing and restore the switch state that
+ * existed immediately before Flash was started.
+ */
+def stopFlash() {
+    if (state.softwareFlashing != true) {
+        log.warn "Stop Flash requested, but driver-controlled flashing is not active."
+        return []
+    }
+
+    String restoreSwitch = state.softwareFlashRestoreSwitch?.toString()
+    cancelSoftwareFlash(true)
+    log.warn "Stopping driver-controlled RGB flash; restoring light ${restoreSwitch == 'on' ? 'on' : 'off'}"
+
+    return [
+        restoreSwitch == "on" ? immediateLightOnCommand() : immediateLightOffCommand(),
+        "delay 300",
+        readAttrCmd(CLUSTER_ON_OFF, 0x0000),
+        "delay 200",
+        readAttrCmd(CLUSTER_LEVEL, 0x0000)
+    ]
+}
+
+def softwareFlashSafetyStop() {
+    if (state.softwareFlashing == true) {
+        log.warn "Driver-controlled RGB flash reached its automatic safety stop."
+        return stopFlash()
+    }
+    return []
+}
+
+def softwareFlashOn() {
+    if (state.softwareFlashing != true) return []
+
+    Integer rateMs = Math.max(500, Math.min(30000, safeToInt(state.softwareFlashRateMs, 1000)))
+    runInMillis(rateMs, "softwareFlashOff")
+    return immediateLightOnCommand()
+}
+
+def softwareFlashOff() {
+    if (state.softwareFlashing != true) return []
+
+    Integer rateMs = Math.max(500, Math.min(30000, safeToInt(state.softwareFlashRateMs, 1000)))
+    runInMillis(rateMs, "softwareFlashOn")
+    return immediateLightOffCommand()
+}
+
+private void cancelSoftwareFlash(Boolean clearRestoreState = true) {
+    state.softwareFlashing = false
+    unschedule("softwareFlashOn")
+    unschedule("softwareFlashOff")
+    unschedule("softwareFlashSafetyStop")
+    state.remove("softwareFlashRateMs")
+    if (clearRestoreState) state.remove("softwareFlashRestoreSwitch")
+}
+
+private String immediateLightOnCommand() {
+    return "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0006 0x01 {}"
+}
+
+private String immediateLightOffCommand() {
+    return "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x0006 0x00 {}"
+}
+
+/**
+ * Starts the standard Zigbee Color Loop Set effect.
+ * Testing confirmed this device-side effect on R3 firmware 1.00.40.
+ */
+def startColorLoop() {
+    cancelSoftwareFlash(true)
+
+    Integer cycleSeconds = Math.max(1, Math.min(65535, safeToInt(settings.colorLoopCycleSeconds, 10)))
+    Integer direction = safeToInt(settings.colorLoopDirection, 1) == 0 ? 0 : 1
+    String timeLE = intTo16bitUnsignedHexLE(cycleSeconds)
+
+    log.warn "Starting RGB color loop: ${cycleSeconds}s per cycle, " +
+        (direction == 1 ? "increasing hue" : "decreasing hue")
+
+    sendEventIfChanged("colorMode", "RGB", "${device.displayName} color mode is RGB", null)
+    return "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x${zigbee.convertToHexString(CLUSTER_COLOR, 4)} 0x${intTo8bitUnsignedHex(CMD_COLOR_LOOP_SET)} {07 02 ${intTo8bitUnsignedHex(direction)} ${timeLE} 00 00}"
+}
+
+/** Stops the device-side Color Loop effect without altering the selected steady color. */
+def stopColorLoop() {
+    log.warn "Stopping RGB color loop..."
+    return colorLoopStopCommand()
+}
+
+private String colorLoopStopCommand() {
+    // Update Action only; Action 0x00 deactivates the color loop.
+    return "he cmd 0x${device.deviceNetworkId} 0x${device.endpointId} 0x${zigbee.convertToHexString(CLUSTER_COLOR, 4)} 0x${intTo8bitUnsignedHex(CMD_COLOR_LOOP_SET)} {01 00 00 00 00 00 00}"
 }
 
 private List buildDeviceSettingWrites() {
