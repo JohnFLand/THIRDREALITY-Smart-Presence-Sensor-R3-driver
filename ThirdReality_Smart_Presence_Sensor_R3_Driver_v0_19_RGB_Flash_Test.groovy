@@ -1,6 +1,8 @@
 /**
  *  THIRDREALITY Smart Presence Sensor R3 (3RPL01084Z)
  *  Version 0.19
+
+ 
  ===============================================================================================================
  A HUGE shout-out to @Hubitrep at the Hubitat forum for allowing me to use his code at
  https://raw.githubusercontent.com/hubitrep/hubitat/refs/heads/main/thirdreality/ThirdReality_3RPL01084Z.groovy
@@ -8,6 +10,8 @@
  That code helped add new and significant functionality to the existing driver created by 
  my CCC team (Coding Claude & ChatGPT).
  ===============================================================================================================
+
+ 
  *  Hubitat driver providing:
  *   -  RGB and color-temperature light control
  *   -  mmWave occupancy/presence reporting as MotionSensor plus custom occupancy
